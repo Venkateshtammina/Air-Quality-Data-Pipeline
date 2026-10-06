@@ -1,0 +1,8 @@
+version: 2
+
+models:
+  - name: hourly_air_quality
+    columns:
+      - name: station_id
+        data_tests:
+          - not_null

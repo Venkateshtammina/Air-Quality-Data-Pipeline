@@ -1,0 +1,14 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: public
+    tables:
+      - name: air_quality_readings
+        columns:
+          - name: station_id
+            data_tests:
+              - not_null
+          - name: timestamp
+            data_tests:
+              - not_null

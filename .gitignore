@@ -1,0 +1,31 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+.env.*
+
+# Local data
+data/
+
+# Logs
+logs/
+*.log
+
+# dbt generated files
+dbt/*/target/
+dbt/*/logs/
+
+# Runtime / ingestion artifacts
+checkpoint.json
+new_records.json
+incremental_checkpoint.json
+reconciliation.json
+transform_error.txt
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/

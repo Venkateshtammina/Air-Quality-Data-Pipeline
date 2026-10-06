@@ -1,0 +1,9 @@
+version: 2
+
+models:
+  - name: daily_air_quality
+    columns:
+      - name: station_id
+        data_tests:
+          - not_null
+          

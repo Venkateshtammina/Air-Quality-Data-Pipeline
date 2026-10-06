@@ -1,0 +1,16 @@
+version: 2
+
+models:
+  - name: mart_daily_pollution
+    columns:
+      - name: station_id
+        data_tests:
+          - not_null
+
+      - name: date
+        data_tests:
+          - not_null
+
+      - name: pollution_rank
+        data_tests:
+          - not_null
