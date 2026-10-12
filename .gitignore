@@ -1,22 +1,28 @@
 # Python
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
 
 # Environment / secrets
 .env
 .env.*
+!.env.example
 
-# Local data
+# Local data and generated datasets
 data/
+*.parquet
 
-# Logs
+# Logs and test artifacts
 logs/
 *.log
+.pytest_cache/
+.coverage
+htmlcov/
 
 # dbt generated files
 dbt/*/target/
 dbt/*/logs/
+dbt/*/dbt_packages/
 
 # Runtime / ingestion artifacts
 checkpoint.json
@@ -24,8 +30,26 @@ new_records.json
 incremental_checkpoint.json
 reconciliation.json
 transform_error.txt
+checkpoints/
+
+# Local database backups
+*.dump
 
 # OS / IDE
 .DS_Store
 Thumbs.db
 .vscode/
+.idea/
+
+# Airflow local artifacts
+airflow/logs/
+airflow/.env
+airflow/.env.*
+
+# Spark local artifacts
+spark-warehouse/
+metastore_db/
+derby.log/
+
+# Local Airflow configuration
+/config/airflow.cfg

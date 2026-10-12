@@ -1,140 +1,232 @@
-# Air Quality Data Pipeline
+# Air Quality Data Pipeline with RAG-Powered Text-to-SQL
 
-An end-to-end data engineering pipeline that ingests Bengaluru air-quality data from a public API, stores raw data in S3, transforms and validates it with PySpark, loads curated data into PostgreSQL, and builds analytical models with dbt. Apache Airflow orchestrates the workflow.
+An end-to-end data engineering project that ingests Bengaluru air-quality data from the OpenCity API, stores raw and curated data in Amazon S3, transforms it with PySpark, loads it into PostgreSQL, and models it with dbt. Apache Airflow orchestrates the pipeline.
+
+The project also includes a RAG-powered text-to-SQL assistant that converts natural-language questions into validated, read-only SQL queries against the air-quality warehouse.
 
 ## Architecture
 
-```text
-Public API
-    ↓
-Python Ingestion
-    ↓
-S3 Raw Data
-    ↓
-PySpark Transformation
-    ↓
-Data Quality Gate
-    ↓
-S3 Curated Parquet
-    ↓
-PostgreSQL
-    ↓
-dbt Analytics Models
+### Data Pipeline
 
-        ↑
-   Apache Airflow
-   Orchestration
+```text
+OpenCity Air Quality API
+          |
+          v
+Python Ingestion (pagination, retries, checkpoints)
+          |
+          v
+Amazon S3 — Raw JSON
+          |
+          v
+PySpark Transformations
+          |
+          v
+Data Quality Validation
+          |
+          v
+Amazon S3 — Curated Parquet
+          |
+          v
+PostgreSQL (Neon) — Star Schema
+          |
+          v
+dbt Models and Data Marts
 ```
 
-## Tech Stack
+### Text-to-SQL Assistant
 
-- **Python** — API ingestion, retries, checkpointing and incremental processing
-- **Amazon S3** — raw and curated data storage
-- **PySpark** — transformation, cleaning and deduplication
-- **PostgreSQL** — curated relational data store
-- **dbt** — analytical transformations and data tests
-- **Apache Airflow** — workflow orchestration and retries
-- **Docker** — local infrastructure and Airflow environment
-- **MinIO** — S3-compatible local object storage
+```text
+Natural Language Question
+          |
+          v
+Semantic Retrieval (schema context)
+          |
+          v
+Gemini SQL Generation
+          |
+          v
+SQLGlot Validation
+          |
+          v
+Read-Only PostgreSQL Execution
+          |
+          v
+Results and Explanation
+```
 
-## Pipeline
+## Technology Stack
 
-### 1. Ingestion
+| Technology | Purpose |
+|---|---|
+| Python | Ingestion, pipeline logic, RAG application |
+| Amazon S3 | Raw JSON and curated Parquet storage |
+| PySpark | Transformation and data quality validation |
+| PostgreSQL (Neon) | Analytical data warehouse |
+| dbt | SQL transformations and data marts |
+| Apache Airflow, Docker | Workflow orchestration |
+| Sentence Transformers, scikit-learn | Embeddings and cosine-similarity retrieval |
+| Gemini API | SQL generation and result explanations |
+| SQLGlot | SQL parsing and validation |
 
-Fetches air-quality records from the public API using pagination and retry handling.
+## Data Pipeline
 
-The ingestion layer also implements:
+### Ingestion
 
-- Checkpoint-based processing
-- Incremental reconciliation
-- Duplicate detection
-- Failure-safe checkpoint updates
-- Idempotent processing
+Python retrieves records from the OpenCity API and writes the raw JSON to Amazon S3. The ingestion layer supports:
 
-Raw JSON records are stored in S3.
+- Paginated API extraction
+- Retries for transient failures
+- Checkpoint-based recovery with failure-safe checkpoint updates
+- Incremental ingestion and reconciliation
+- Duplicate detection and idempotent runs
 
-### 2. Transformation
+### Transformation and Data Quality
 
-PySpark processes the raw data and:
+PySpark standardizes timestamps, removes invalid and duplicate records, and writes curated Parquet data to Amazon S3. A quality gate blocks downstream tasks if any of the following validations fail:
 
-- Parses timestamps
-- Removes invalid records
-- Deduplicates by `station_id + timestamp`
-- Removes completely null columns
-- Performs data validation
-- Writes curated data as Parquet
+- Dataset is not empty
+- Required station and timestamp fields are present
+- PM2.5 and wind speed are non-negative
+- Relative humidity is between 0 and 100
+- Wind direction is in the range [0, 360)
+- Station and timestamp combinations are unique
 
-### 3. Data Quality
+### Data Warehouse
 
-The pipeline validates:
+Curated data is loaded into PostgreSQL (Neon) using a star schema:
 
-- Non-empty dataset
-- Non-null station IDs and timestamps
-- PM2.5 ≥ 0
-- Wind speed ≥ 0
-- Relative humidity between 0–100
-- Wind direction between 0–360
-- Unique `station_id + timestamp`
+| Table | Purpose |
+|---|---|
+| `fact_air_quality` | Air-quality measurements |
+| `dim_date` | Calendar attributes |
+| `dim_time` | Time attributes |
+| `dim_station` | Monitoring station attributes |
 
-The quality gate runs before PostgreSQL loading.
+### dbt Models
 
-### 4. PostgreSQL + dbt
-
-Validated Parquet data is loaded into PostgreSQL through a staging table with conflict handling to maintain idempotency.
-
-dbt then creates analytical models including:
-
-- Daily air quality
-- Hourly air quality
+- Staging of air-quality readings
+- Hourly and daily aggregations
+- Incremental air-quality processing
 - Daily pollution mart
 
-## Airflow DAG
+### Airflow Orchestration
+
+The main DAG runs the following tasks in order, so each step executes only after its predecessor succeeds:
 
 ```text
-run_air_quality_ingestion
-            ↓
-transform_air_quality
-            ↓
-data_quality_gate
-            ↓
-load_air_quality_to_postgres
+run_air_quality_ingestion → transform_air_quality → data_quality_gate → load_air_quality_to_postgres
 ```
 
-Tasks are configured with dependencies and retries so downstream processing only occurs after successful upstream execution.
+## Text-to-SQL Assistant
+
+1. **Retrieve:** Sentence Transformers embeddings and cosine similarity select relevant schema information and query guidance.
+2. **Generate:** Gemini produces SQL from the retrieved context.
+3. **Validate:** SQLGlot checks the generated query.
+4. **Execute:** Approved queries run against PostgreSQL in a read-only transaction.
+5. **Explain:** Results are presented in natural language.
+
+### Safety Controls
+
+- Only approved read-only query types are executed
+- Multiple statements and disallowed operations are rejected
+- Queries are limited to approved air-quality tables
+- Read-only database transactions with a 15-second statement timeout
+- Fallback to raw database results if answer generation fails
+- Out-of-scope questions are declined
+
+> **Note:** The retrieval knowledge base is held in memory; a persistent vector database is not used.
 
 ## Results
 
-- **70,176** valid air-quality records processed
-- **70,176** unique `station_id + timestamp` records
-- Data quality checks: **PASS**
-- PostgreSQL load: **SUCCESS**
-- dbt build: **22/22** checks and operations passed
+| Metric | Result |
+|---|---:|
+| Valid air-quality records | 70,176 |
+| Unique station-timestamp combinations | 70,176 |
+| Data coverage | January 2024 – December 2025 |
+| Monitoring stations | 1 |
+| dbt checks and operations | 22/22 passed |
+| SQL validator checks | 7 passed |
+| Query engine unit tests | 6 passed |
+| Retriever unit tests | 3 passed |
 
 ## Project Structure
 
 ```text
 Air-Quality-Data-Pipeline/
-│
+├── src/
+│   ├── ingestion/        # API client, checkpoints, deduplication, S3 storage
+│   ├── spark/            # Transformations, data quality, PostgreSQL load
+│   └── rag/              # Retriever, SQL generator, validator, query engine
 ├── airflow/
 │   ├── dags/
+│   ├── config/
 │   ├── Dockerfile
 │   └── docker-compose.yaml
-│
 ├── dbt/
 │   └── agri_dbt/
 │       └── models/
-│
-├── src/
-│   ├── ingestion/
-│   └── spark/
-│
-├── data/
-├── logs/
-├── .venv/
-├── .gitignore
 └── README.md
 ```
 
-## Key Engineering Concepts
+## Getting Started
 
-**API ingestion • S3 data lake • PySpark • Data quality • PostgreSQL • dbt • Airflow • Docker • Checkpointing • Incremental processing • Idempotency • Deduplication**
+### Prerequisites
+
+- Python 3.11+
+- Java (compatible with your PySpark version)
+- Docker Desktop
+- An Amazon S3 bucket and configured AWS credentials
+- A PostgreSQL database (e.g., Neon)
+- A Gemini API key
+
+### Installation
+
+```bash
+git clone <your-repository-url>
+cd Air-Quality-Data-Pipeline
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1      # Windows PowerShell
+# source .venv/bin/activate       # macOS / Linux
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### Configuration
+
+Create a `.env` file in the project root (never commit it):
+
+```dotenv
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=gemini-3.1-flash-lite
+DATABASE_URL=your_neon_postgresql_connection_url
+```
+
+AWS credentials and S3 settings are also required for the ingestion and Spark stages.
+
+### Usage
+
+Start Airflow:
+
+```bash
+docker compose -f airflow/docker-compose.yaml up -d
+```
+
+Run the text-to-SQL assistant:
+
+```bash
+python -m src.rag.main
+```
+
+Run the tests:
+
+```bash
+python -m src.rag.test_sql_validator
+python -m src.rag.test_query_engine
+python -m src.rag.test_retriever
+```
+
+## Author
+
+**Venkatesh T** — Data Engineer

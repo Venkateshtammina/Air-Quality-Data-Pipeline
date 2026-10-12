@@ -5,7 +5,7 @@ from data_quality import validate_curated_data
 from pyspark.sql.functions import (
     col,
     explode,
-    to_timestamp,
+    to_timestamp_ntz,
     to_date,
     year,
     month,
@@ -206,7 +206,7 @@ for column_name in double_columns:
 
 records_df = records_df.withColumn(
     "Timestamp",
-    to_timestamp(col("Timestamp"))
+    to_timestamp_ntz(col("Timestamp"))
 )
 
 
