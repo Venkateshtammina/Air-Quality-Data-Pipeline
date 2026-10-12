@@ -226,7 +226,3 @@ python -m src.rag.test_sql_validator
 python -m src.rag.test_query_engine
 python -m src.rag.test_retriever
 ```
-
-## Author
-
-**Venkatesh T** — Data Engineer
