@@ -15,6 +15,8 @@ USER airflow
 # Install project dependencies
 RUN pip install --no-cache-dir \
     pyspark==4.2.0 \
+    dbt-core==1.12.5 \
+    dbt-postgres==1.11.0 \
     boto3 \
     requests \
     psycopg2-binary

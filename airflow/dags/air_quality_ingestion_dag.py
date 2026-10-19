@@ -2,6 +2,8 @@
 from datetime import datetime, timedelta
 import os
 import sys
+import subprocess
+from urllib.parse import parse_qs, unquote, urlparse
 
 import psycopg2
 
@@ -90,6 +92,53 @@ def load_neon_incrementally():
 # ------------------------------------------------------------
 # Final Neon verification
 # ------------------------------------------------------------
+
+def run_dbt_models():
+    """Build and test the analytics models after the Neon batch load."""
+
+    database_url = os.environ.get("NEON_DATABASE_URL")
+    if not database_url:
+        raise RuntimeError(
+            "NEON_DATABASE_URL is not configured in the Airflow environment."
+        )
+
+    parsed_url = urlparse(database_url)
+    if not parsed_url.hostname or not parsed_url.path.strip("/"):
+        raise RuntimeError("NEON_DATABASE_URL is not a valid PostgreSQL URL.")
+
+    query = parse_qs(parsed_url.query)
+    dbt_environment = os.environ.copy()
+    dbt_environment.update({
+        "DBT_HOST": parsed_url.hostname,
+        "DBT_USER": unquote(parsed_url.username or ""),
+        "DBT_PASSWORD": unquote(parsed_url.password or ""),
+        "DBT_PORT": str(parsed_url.port or 5432),
+        "DBT_DBNAME": unquote(parsed_url.path.lstrip("/")),
+        "DBT_SSLMODE": query.get("sslmode", ["require"])[0],
+    })
+
+    project_dir = "/opt/airflow/dbt/agri_dbt"
+    profiles_dir = "/opt/airflow/dbt"
+
+    subprocess.run(
+        [
+            "dbt", "run",
+            "--project-dir", project_dir,
+            "--profiles-dir", profiles_dir,
+        ],
+        check=True,
+        env=dbt_environment,
+    )
+    subprocess.run(
+        [
+            "dbt", "test",
+            "--project-dir", project_dir,
+            "--profiles-dir", profiles_dir,
+        ],
+        check=True,
+        env=dbt_environment,
+    )
+
 
 def verify_neon_data():
     """Confirm batch completion and the small shared time dimension."""
@@ -180,6 +229,11 @@ with DAG(
         python_callable=load_neon_incrementally,
     )
 
+    dbt_task = PythonOperator(
+        task_id="run_and_test_dbt_models",
+        python_callable=run_dbt_models,
+    )
+
     neon_verification_task = PythonOperator(
         task_id="verify_neon_data",
         python_callable=verify_neon_data,
@@ -190,5 +244,6 @@ with DAG(
         >> spark_transform_task
         >> data_quality_task
         >> incremental_neon_load_task
+        >> dbt_task
         >> neon_verification_task
     )

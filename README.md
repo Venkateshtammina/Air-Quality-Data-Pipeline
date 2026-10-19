@@ -91,7 +91,7 @@ PySpark standardizes timestamps, removes invalid and duplicate records, and writ
 - Wind direction is in the range [0, 360)
 - Station and timestamp combinations are unique
 
-The recurring transformation tracks raw S3 objects by key and ETag in an S3 manifest. It processes only new or changed raw page files and writes a run-scoped curated batch as well as appending new records to the accumulated curated dataset. The quality gate and Neon loader read only that batch. The loader inserts its station/timestamp keys, updates only the affected dimensions, and inserts only those facts in one database transaction. A pending-batch marker remains in S3 until the transaction succeeds, so retries reuse the same batch safely. The final Airflow check is batch-aware and avoids recounting the full warehouse.
+The recurring transformation tracks raw S3 objects by key and ETag in an S3 manifest. It processes only new or changed raw page files and writes a run-scoped curated batch as well as appending new records to the accumulated curated dataset. The quality gate and Neon loader read only that batch. The loader inserts its station/timestamp keys, updates only the affected dimensions, and inserts only those facts in one database transaction. A pending-batch marker remains in S3 until the transaction succeeds, so retries reuse the same batch safely. After loading, Airflow runs `dbt run` and `dbt test` to refresh and check the analytics models. The final Airflow check is batch-aware and avoids recounting the full warehouse.
 
 ### Data Warehouse
 
@@ -116,7 +116,7 @@ Curated data is loaded into PostgreSQL (Neon) using a star schema:
 The main DAG runs the following tasks in order, so each step executes only after its predecessor succeeds:
 
 ```text
-run_air_quality_ingestion → transform_air_quality → data_quality_gate → incremental_neon_and_star_schema_load → verify_neon_data
+run_air_quality_ingestion → transform_air_quality → data_quality_gate → incremental_neon_and_star_schema_load → run_and_test_dbt_models → verify_neon_data
 ```
 
 ## Text-to-SQL Assistant
@@ -207,14 +207,17 @@ NEON_DATABASE_URL=your_neon_postgresql_connection_url
 ```
 
 AWS credentials and S3 settings are also required for the ingestion and Spark stages.
+Airflow reads its environment from `airflow/.env`; set `NEON_DATABASE_URL` there. The dbt task derives its connection fields from that URL, so no separate dbt password is needed.
 
 ### Usage
 
 Start Airflow:
 
 ```bash
-docker compose -f airflow/docker-compose.yaml up -d
+docker compose -f airflow/docker-compose.yaml up -d --build
 ```
+
+The build installs dbt and the Postgres adapter in the Airflow image. Rebuild the image after changing its dependencies.
 
 Run the text-to-SQL assistant:
 
