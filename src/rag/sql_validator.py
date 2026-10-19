@@ -10,6 +10,7 @@ ALLOWED_TABLES = {
     "dim_station",
 }
 
+ALLOWED_ANONYMOUS_FUNCTIONS = set()
 
 
 def validate_sql(sql: str) -> str:
@@ -64,6 +65,13 @@ def validate_sql(sql: str) -> str:
                 "The query contains a prohibited SQL operation."
             )
 
+        if isinstance(node, exp.Anonymous):
+            function_name = node.name.lower()
+            if function_name not in ALLOWED_ANONYMOUS_FUNCTIONS:
+                raise ValueError(
+                    f"Function '{node.name}' is not permitted."
+                )
+
     # Collect CTE names so references to them aren't mistaken
     # for unapproved physical database tables.
     cte_names = {
@@ -71,13 +79,23 @@ def validate_sql(sql: str) -> str:
         for cte in query.find_all(exp.CTE)
         if cte.alias_or_name
     }
+    cte_self_references = {
+        cte.alias_or_name.lower()
+        for cte in query.find_all(exp.CTE)
+        if cte.alias_or_name
+        and any(
+            table.name.lower() == cte.alias_or_name.lower()
+            for table in cte.this.find_all(exp.Table)
+        )
+    }
 
     # Restrict physical table references to approved public tables.
     for table in query.find_all(exp.Table):
         table_name = table.name.lower()
 
-        # A CTE is a temporary query result, not a physical table.
-        if table_name in cte_names and not table.db and not table.catalog:
+        refers_to_own_cte = table_name in cte_self_references
+        if (table_name in cte_names and not refers_to_own_cte
+                and not table.db and not table.catalog):
             continue
 
         if table_name not in ALLOWED_TABLES:

@@ -130,6 +130,7 @@ run_air_quality_ingestion → transform_air_quality → data_quality_gate → lo
 - Only approved read-only query types are executed
 - Multiple statements and disallowed operations are rejected
 - Queries are limited to approved air-quality tables
+- The validator rejects unknown functions and CTE shadowing of physical tables
 - Read-only database transactions with a 15-second statement timeout
 - Fallback to raw database results if answer generation fails
 - Out-of-scope questions are declined
@@ -145,7 +146,7 @@ run_air_quality_ingestion → transform_air_quality → data_quality_gate → lo
 | Data coverage | January 2024 – December 2025 |
 | Monitoring stations | 1 |
 | dbt checks and operations | 22/22 passed |
-| SQL validator checks | 7 passed |
+| SQL validator unit tests | 15 passed |
 | Query engine unit tests | 6 passed |
 | Retriever unit tests | 3 passed |
 
@@ -200,7 +201,7 @@ Create a `.env` file in the project root (never commit it):
 ```dotenv
 GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-3.1-flash-lite
-DATABASE_URL=your_neon_postgresql_connection_url
+NEON_DATABASE_URL=your_neon_postgresql_connection_url
 ```
 
 AWS credentials and S3 settings are also required for the ingestion and Spark stages.

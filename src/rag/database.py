@@ -1,5 +1,6 @@
 
 import os
+from contextlib import closing
 from pathlib import Path
 
 import psycopg2
@@ -26,22 +27,23 @@ def execute_read_only_query(sql: str) -> list[dict]:
             "NEON_DATABASE_URL is missing from the root .env file."
         )
 
-    with psycopg2.connect(
+    with closing(psycopg2.connect(
         database_url,
         connect_timeout=10,
         cursor_factory=RealDictCursor,
-    ) as connection:
-        connection.set_session(
-            readonly=True,
-            autocommit=False,
-        )
+    )) as connection:
+        with connection:
+            connection.set_session(
+                readonly=True,
+                autocommit=False,
+            )
 
-        with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL statement_timeout = '15s'")
-            cursor.execute("SET LOCAL TIME ZONE 'UTC'")
-            cursor.execute(safe_sql)
+            with connection.cursor() as cursor:
+                cursor.execute("SET LOCAL statement_timeout = '15s'")
+                cursor.execute("SET LOCAL TIME ZONE 'UTC'")
+                cursor.execute(safe_sql)
 
-            if cursor.description is None:
-                raise ValueError("The query did not return a result set.")
+                if cursor.description is None:
+                    raise ValueError("The query did not return a result set.")
 
-            return [dict(row) for row in cursor.fetchall()]
+                return [dict(row) for row in cursor.fetchall()]
