@@ -92,7 +92,19 @@ def load_neon_incrementally():
 # ------------------------------------------------------------
 
 def verify_neon_data():
-    """Verify source, fact, and dimension consistency without inserts."""
+    """Confirm batch completion and the small shared time dimension."""
+
+    spark_path = "/opt/airflow/src/spark"
+    if spark_path not in sys.path:
+        sys.path.insert(0, spark_path)
+
+    from batch_state import get_pending_batch
+
+    pending_batch = get_pending_batch()
+    if pending_batch is not None:
+        raise RuntimeError(
+            "The transformed batch was not marked complete by the loader."
+        )
 
     database_url = os.environ.get("NEON_DATABASE_URL")
 
@@ -108,101 +120,18 @@ def verify_neon_data():
     ) as connection:
         with connection.cursor() as cursor:
 
-            # Source-table count and uniqueness
-            cursor.execute("""
-                SELECT
-                    COUNT(*),
-                    MIN("timestamp"),
-                    MAX("timestamp"),
-                    COUNT(DISTINCT (station_id, "timestamp"))
-                FROM public.air_quality_readings
-            """)
-
-            source_count, min_timestamp, max_timestamp, unique_keys = (
-                cursor.fetchone()
-            )
-
-            # Fact-table count
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM public.fact_air_quality
-            """)
-            fact_count = cursor.fetchone()[0]
-
-            # Ensure every source row maps to all required dimensions.
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM public.air_quality_readings r
-                LEFT JOIN public.dim_station s
-                    ON s.station_id = r.station_id
-                LEFT JOIN public.dim_date d
-                    ON d.full_date = r."timestamp"::date
-                LEFT JOIN public.dim_time t
-                    ON t.hour =
-                       EXTRACT(HOUR FROM r."timestamp")::INTEGER
-                WHERE s.station_key IS NULL
-                   OR d.date_key IS NULL
-                   OR t.time_key IS NULL
-            """)
-            missing_dimension_refs = cursor.fetchone()[0]
-
-            # Ensure all fact rows reference existing dimensions.
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM public.fact_air_quality f
-                LEFT JOIN public.dim_station s
-                    ON s.station_key = f.station_key
-                LEFT JOIN public.dim_date d
-                    ON d.date_key = f.date_key
-                LEFT JOIN public.dim_time t
-                    ON t.time_key = f.time_key
-                WHERE s.station_key IS NULL
-                   OR d.date_key IS NULL
-                   OR t.time_key IS NULL
-            """)
-            invalid_fact_refs = cursor.fetchone()[0]
-
-            # Check expected hourly dimension coverage.
+            # The loader performs batch-scoped source/fact/dimension checks
+            # in its transaction. This stable shared dimension is small.
             cursor.execute("""
                 SELECT COUNT(*), COUNT(DISTINCT hour)
                 FROM public.dim_time
             """)
             time_row_count, distinct_hours = cursor.fetchone()
 
-    print("\n========== Neon Verification ==========")
-    print(f"Source records: {source_count:,}")
-    print(f"Fact records: {fact_count:,}")
-    print(f"Unique source keys: {unique_keys:,}")
-    print(f"Earliest timestamp: {min_timestamp}")
-    print(f"Latest timestamp: {max_timestamp}")
-    print(f"Source rows missing dimension matches: {missing_dimension_refs:,}")
-    print(f"Facts with invalid dimension references: {invalid_fact_refs:,}")
+    print("\n========== Incremental Load Verification ==========")
+    print("Pending batch: none (loader committed and marked it complete)")
     print(f"Time dimension rows: {time_row_count}")
-    print("=======================================")
-
-    if source_count == 0:
-        raise RuntimeError("The Neon source table is empty.")
-
-    if unique_keys != source_count:
-        raise RuntimeError(
-            "Source-table station/timestamp keys are not unique."
-        )
-
-    if fact_count != source_count:
-        raise RuntimeError(
-            f"Source/fact count mismatch: {source_count:,} source rows "
-            f"versus {fact_count:,} fact rows."
-        )
-
-    if missing_dimension_refs != 0:
-        raise RuntimeError(
-            f"{missing_dimension_refs:,} source rows lack dimension matches."
-        )
-
-    if invalid_fact_refs != 0:
-        raise RuntimeError(
-            f"{invalid_fact_refs:,} fact rows have invalid dimension references."
-        )
+    print("===================================================")
 
     if time_row_count != 24 or distinct_hours != 24:
         raise RuntimeError(

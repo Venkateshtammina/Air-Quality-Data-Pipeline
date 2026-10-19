@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import TimestampNTZType
+from batch_state import complete_pending_batch, get_pending_batch
 
 
 # ------------------------------------------------------------
@@ -158,12 +159,12 @@ def create_spark_session():
 # Shared curated-data validation
 # ------------------------------------------------------------
 
-def _read_curated_data(spark):
+def _read_curated_data(spark, path=S3_PATH):
     """Read the curated Parquet dataset and validate its structure."""
 
-    print(f"\nReading curated data from: {S3_PATH}")
+    print(f"\nReading curated data from: {path}")
 
-    df = spark.read.parquet(S3_PATH)
+    df = spark.read.parquet(path)
 
     missing_columns = sorted(set(COLUMNS) - set(df.columns))
     if missing_columns:
@@ -238,10 +239,10 @@ def read_and_validate_curated_data(spark):
     return df
 
 
-def read_incremental_curated_data(spark):
+def read_incremental_curated_data(spark, path):
     """Validation for recurring loading without fixed count limits."""
 
-    df, _, _ = _read_curated_data(spark)
+    df, _, _ = _read_curated_data(spark, path)
     print("Incremental input validation PASSED.")
     return df
 
@@ -427,6 +428,14 @@ INCREMENTAL_INSERT_SQL = """
 def load_incremental_to_neon(curated_df, cursor):
     """Insert missing source readings using the caller's transaction."""
 
+    cursor.execute("""
+        CREATE TEMP TABLE air_quality_batch_keys (
+            station_id TEXT NOT NULL,
+            reading_timestamp TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+            PRIMARY KEY (station_id, reading_timestamp)
+        ) ON COMMIT DROP
+    """)
+
     inserted_count = 0
     batch = []
 
@@ -443,6 +452,18 @@ def load_incremental_to_neon(curated_df, cursor):
         batch.append(record)
 
         if len(batch) >= BATCH_SIZE:
+            key_rows = [
+                (row[COLUMNS.index("station_id")],
+                 row[COLUMNS.index("timestamp")])
+                for row in batch
+            ]
+            execute_values(
+                cursor,
+                "INSERT INTO air_quality_batch_keys VALUES %s "
+                "ON CONFLICT DO NOTHING",
+                key_rows,
+                page_size=BATCH_SIZE,
+            )
             execute_values(
                 cursor,
                 INCREMENTAL_INSERT_SQL,
@@ -453,6 +474,18 @@ def load_incremental_to_neon(curated_df, cursor):
             batch.clear()
 
     if batch:
+        key_rows = [
+            (row[COLUMNS.index("station_id")],
+             row[COLUMNS.index("timestamp")])
+            for row in batch
+        ]
+        execute_values(
+            cursor,
+            "INSERT INTO air_quality_batch_keys VALUES %s "
+            "ON CONFLICT DO NOTHING",
+            key_rows,
+            page_size=BATCH_SIZE,
+        )
         execute_values(
             cursor,
             INCREMENTAL_INSERT_SQL,
@@ -487,6 +520,9 @@ def load_dim_date(cursor):
             TRIM(TO_CHAR(r."timestamp", 'Day')),
             EXTRACT(ISODOW FROM r."timestamp") IN (6, 7)
         FROM public.air_quality_readings r
+        JOIN air_quality_batch_keys b
+          ON b.station_id = r.station_id
+         AND b.reading_timestamp = r."timestamp"
         WHERE r."timestamp" IS NOT NULL
         ON CONFLICT DO NOTHING
     """)
@@ -518,9 +554,12 @@ def load_dim_station(cursor):
             station_id, station_name, city, state
         )
         SELECT DISTINCT
-            station_id, station_name, city, state
-        FROM public.air_quality_readings
-        WHERE station_id IS NOT NULL
+            r.station_id, r.station_name, r.city, r.state
+        FROM public.air_quality_readings r
+        JOIN air_quality_batch_keys b
+          ON b.station_id = r.station_id
+         AND b.reading_timestamp = r."timestamp"
+        WHERE r.station_id IS NOT NULL
         ON CONFLICT (station_id) DO UPDATE SET
             station_name = EXCLUDED.station_name,
             city = EXCLUDED.city,
@@ -574,6 +613,9 @@ def load_fact_air_quality(cursor):
             r.nh3,
             r.pm25_category
         FROM public.air_quality_readings r
+        JOIN air_quality_batch_keys b
+          ON b.station_id = r.station_id
+         AND b.reading_timestamp = r."timestamp"
         JOIN public.dim_station s
           ON s.station_id = r.station_id
         JOIN public.dim_date d
@@ -592,15 +634,38 @@ def load_fact_air_quality(cursor):
 # ------------------------------------------------------------
 
 def verify_star_schema(cursor):
-    """Verify source/fact counts and dimension references."""
+    """Verify source/fact counts and dimension references for this batch."""
 
     cursor.execute("""
         SELECT
-            (SELECT COUNT(*) FROM public.air_quality_readings),
-            (SELECT COUNT(*) FROM public.fact_air_quality),
+            (SELECT COUNT(*) FROM air_quality_batch_keys),
             (
                 SELECT COUNT(*)
-                FROM public.air_quality_readings r
+                FROM air_quality_batch_keys b
+                JOIN public.air_quality_readings r
+                  ON r.station_id = b.station_id
+                 AND r."timestamp" = b.reading_timestamp
+            ),
+            (
+                SELECT COUNT(*)
+                FROM air_quality_batch_keys b
+                JOIN public.air_quality_readings r
+                  ON r.station_id = b.station_id
+                 AND r."timestamp" = b.reading_timestamp
+                JOIN public.fact_air_quality f
+                  ON f.reading_timestamp = r."timestamp"
+                 AND f.station_key = (
+                     SELECT s.station_key
+                     FROM public.dim_station s
+                     WHERE s.station_id = r.station_id
+                 )
+            ),
+            (
+                SELECT COUNT(*)
+                FROM air_quality_batch_keys b
+                JOIN public.air_quality_readings r
+                  ON r.station_id = b.station_id
+                 AND r."timestamp" = b.reading_timestamp
                 LEFT JOIN public.dim_station s
                   ON s.station_id = r.station_id
                 LEFT JOIN public.dim_date d
@@ -610,57 +675,26 @@ def verify_star_schema(cursor):
                 WHERE s.station_key IS NULL
                    OR d.date_key IS NULL
                    OR t.time_key IS NULL
-            ),
-            (
-                SELECT COUNT(*)
-                FROM public.fact_air_quality f
-                LEFT JOIN public.dim_station s
-                  ON s.station_key = f.station_key
-                LEFT JOIN public.dim_date d
-                  ON d.date_key = f.date_key
-                LEFT JOIN public.dim_time t
-                  ON t.time_key = f.time_key
-                WHERE s.station_key IS NULL
-                   OR d.date_key IS NULL
-                   OR t.time_key IS NULL
             )
     """)
 
-    source_count, fact_count, missing_source_dimensions, orphan_facts = (
-        cursor.fetchone()
-    )
+    (batch_count, source_count, fact_count,
+     missing_source_dimensions) = cursor.fetchone()
 
-    print("\nStar-schema verification:")
+    print("\nBatch star-schema verification:")
+    print(f"Batch keys:      {batch_count:,}")
     print(f"Source readings: {source_count:,}")
     print(f"Fact readings:   {fact_count:,}")
     print(f"Source rows missing dimensions: {missing_source_dimensions:,}")
-    print(f"Facts with missing dimensions:  {orphan_facts:,}")
 
-    if source_count != fact_count:
+    if source_count != batch_count or fact_count != batch_count:
         raise RuntimeError(
-            f"Source/fact row counts differ: {source_count:,} vs "
-            f"{fact_count:,}."
+            "Batch/source/fact row counts differ: "
+            f"{batch_count:,}/{source_count:,}/{fact_count:,}."
         )
 
-    if missing_source_dimensions != 0 or orphan_facts != 0:
+    if missing_source_dimensions != 0:
         raise RuntimeError("Star-schema dimension-reference checks failed.")
-
-    cursor.execute("""
-        SELECT COUNT(*)
-        FROM (
-            SELECT station_key, reading_timestamp
-            FROM public.fact_air_quality
-            GROUP BY station_key, reading_timestamp
-            HAVING COUNT(*) > 1
-        ) duplicates
-    """)
-
-    duplicate_groups = cursor.fetchone()[0]
-
-    if duplicate_groups:
-        raise RuntimeError(
-            f"Found {duplicate_groups:,} duplicate fact-key groups."
-        )
 
     print("Star-schema verification PASSED.")
 
@@ -677,12 +711,20 @@ def run_incremental_load():
     fails, the database changes for this run are rolled back.
     """
 
+    pending_batch = get_pending_batch()
+    if pending_batch is None:
+        print("No pending transformed batch; Neon load skipped.")
+        return
+
     database_url = get_database_url()
     spark = None
 
     try:
         spark = create_spark_session()
-        curated_df = read_incremental_curated_data(spark)
+        curated_df = read_incremental_curated_data(
+            spark,
+            pending_batch["path"],
+        )
 
         with psycopg2.connect(
             database_url,
@@ -706,6 +748,7 @@ def run_incremental_load():
 
                 verify_star_schema(cursor)
 
+        complete_pending_batch(pending_batch["id"])
         print("Incremental source and star-schema load committed.")
 
     finally:

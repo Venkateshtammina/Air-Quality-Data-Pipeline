@@ -1,6 +1,7 @@
 from pyspark.sql import SparkSession
 
 from data_quality import validate_curated_data
+from batch_state import get_pending_batch
 
 
 CURATED_PATH = "s3a://agri-data-engineering/curated/air_quality/"
@@ -39,15 +40,24 @@ try:
     print("AIR QUALITY DATA QUALITY GATE")
     print("=" * 60)
 
-    print(f"Reading curated data from: {CURATED_PATH}")
+    pending_batch = get_pending_batch()
+    if pending_batch is None:
+        print("No pending transformed batch; quality gate has nothing to check.")
+        raise SystemExit(0)
 
-    curated_df = spark.read.parquet(CURATED_PATH)
+    batch_path = pending_batch["path"]
+    print(f"Reading current curated batch from: {batch_path}")
+
+    curated_df = spark.read.parquet(batch_path)
 
     row_count = curated_df.count()
 
     print(f"Curated records received: {row_count}")
 
-    validate_curated_data(curated_df)
+    if row_count:
+        validate_curated_data(curated_df)
+    else:
+        print("Batch contains no new business keys; skipping row checks.")
 
     print(f"Curated records validated: {row_count}")
     print("Quality status: PASS")

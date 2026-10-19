@@ -1,3 +1,6 @@
+import json
+import hashlib
+
 import boto3
 
 from pyspark.sql import SparkSession
@@ -68,6 +71,11 @@ CURATED_PATH = (
     "curated/air_quality/"
 )
 
+# Tracks which exact raw S3 objects have already been transformed. ETags
+# let a later overwrite of a page file be picked up on the next run.
+TRANSFORM_MANIFEST_KEY = "checkpoints/air_quality_transform_manifest.json"
+BATCH_PREFIX = f"s3a://{BUCKET}/curated/air_quality_batches/"
+
 
 # ---------------------------------------------------------
 # Discover raw ingestion-date paths
@@ -75,8 +83,8 @@ CURATED_PATH = (
 
 def discover_raw_paths():
     """
-    Discover all ingestion-date partitions under the raw
-    air-quality prefix and return Spark-readable paths.
+    Find new or changed raw S3 files and return their Spark paths,
+    together with the updated processed-object manifest.
     """
 
     print("=" * 60)
@@ -90,7 +98,29 @@ def discover_raw_paths():
 
     paginator = s3.get_paginator("list_objects_v2")
 
-    ingestion_dates = set()
+    try:
+        response = s3.get_object(
+            Bucket=BUCKET,
+            Key=TRANSFORM_MANIFEST_KEY,
+        )
+        manifest = json.loads(
+            response["Body"].read().decode("utf-8")
+        )
+        manifest_exists = True
+    except s3.exceptions.NoSuchKey:
+        manifest = {"objects": {}, "pending_batch": None}
+        manifest_exists = False
+
+    # Migrate the original flat key-to-ETag manifest format.
+    if "objects" not in manifest:
+        manifest = {"objects": manifest, "pending_batch": None}
+
+    processed_objects = manifest["objects"]
+    if manifest.get("pending_batch"):
+        print("A transformed batch is awaiting database completion.")
+        return [], manifest, False
+
+    changed_objects = {}
 
     for page in paginator.paginate(
         Bucket=BUCKET,
@@ -99,40 +129,35 @@ def discover_raw_paths():
         for obj in page.get("Contents", []):
             key = obj["Key"]
 
-            if not key.startswith(
-                f"{RAW_PREFIX}ingestion_date="
-            ):
+            if not key.startswith(f"{RAW_PREFIX}ingestion_date="):
                 continue
 
-            relative_key = key[len(RAW_PREFIX):]
+            if not key.endswith(".json"):
+                continue
 
-            date_partition = relative_key.split("/", 1)[0]
+            etag = obj["ETag"].strip('"')
+            if processed_objects.get(key) != etag:
+                changed_objects[key] = etag
 
-            if date_partition.startswith(
-                "ingestion_date="
-            ):
-                ingestion_dates.add(date_partition)
+    if not changed_objects:
+        print("No new or changed raw files; curated data is up to date.")
+        return [], manifest, False
 
-    if not ingestion_dates:
-        raise RuntimeError(
-            "No raw air-quality ingestion-date partitions "
-            "were found in S3."
-        )
-
-    raw_paths = []
-
-    for ingestion_date in sorted(ingestion_dates):
-        path = (
-            f"s3a://{BUCKET}/"
-            f"{RAW_PREFIX}"
-            f"{ingestion_date}/page_*.json"
-        )
-
-        raw_paths.append(path)
+    raw_paths = [f"s3a://{BUCKET}/{key}" for key in sorted(changed_objects)]
+    batch_fingerprint = "\n".join(
+        f"{key}:{changed_objects[key]}" for key in sorted(changed_objects)
+    )
+    batch_id = hashlib.sha256(batch_fingerprint.encode("utf-8")).hexdigest()[:20]
+    updated_manifest = {
+        "objects": {**processed_objects, **changed_objects},
+        "pending_batch": {
+            "id": batch_id,
+            "path": f"{BATCH_PREFIX}batch_id={batch_id}/",
+        },
+    }
 
     print(
-        f"Discovered {len(raw_paths)} "
-        "ingestion-date partition(s):"
+        f"Discovered {len(raw_paths)} new or changed raw file(s):"
     )
 
     for path in raw_paths:
@@ -140,10 +165,24 @@ def discover_raw_paths():
 
     print()
 
-    return raw_paths
+    return raw_paths, updated_manifest, not manifest_exists
 
 
-raw_paths = discover_raw_paths()
+def save_transform_manifest(processed_objects):
+    """Persist the manifest after the curated write has succeeded."""
+    boto3.client("s3", region_name="eu-north-1").put_object(
+        Bucket=BUCKET,
+        Key=TRANSFORM_MANIFEST_KEY,
+        Body=json.dumps(processed_objects, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+raw_paths, updated_manifest, bootstrap_run = discover_raw_paths()
+
+if not raw_paths:
+    spark.stop()
+    raise SystemExit(0)
 
 
 # ---------------------------------------------------------
@@ -398,6 +437,47 @@ curated_df = curated_df.select(
 
 validate_curated_data(curated_df)
 
+# On the first run only, remove keys already in curated Parquet before
+# appending. Still send the full incoming batch to Neon so an existing
+# warehouse can be backfilled idempotently. Recurring runs do not scan the
+# historical curated dataset.
+new_curated_df = curated_df
+if bootstrap_run:
+    curated_objects = boto3.client(
+        "s3",
+        region_name="eu-north-1",
+    ).list_objects_v2(
+        Bucket=BUCKET,
+        Prefix="curated/air_quality/",
+        MaxKeys=1,
+    ).get("Contents", [])
+
+    if curated_objects:
+        existing_keys = (
+            spark.read.parquet(CURATED_PATH)
+            .select("station_id", "timestamp")
+            .dropDuplicates(["station_id", "timestamp"])
+        )
+        new_curated_df = curated_df.join(
+            existing_keys,
+            on=["station_id", "timestamp"],
+            how="left_anti",
+        )
+
+new_count = new_curated_df.count()
+print(f"New curated records to append: {new_count}")
+
+if curated_df.limit(1).count() == 0:
+    save_transform_manifest({
+        "objects": updated_manifest["objects"],
+        "pending_batch": None,
+    })
+    print("No new business keys; downstream batch tasks can skip.")
+    spark.stop()
+    raise SystemExit(0)
+
+batch_path = updated_manifest["pending_batch"]["path"]
+
 print()
 print("=" * 60)
 print("CURATED DATA VALIDATION")
@@ -425,17 +505,29 @@ print("WRITING CURATED DATA TO S3")
 print("=" * 60)
 
 (
-    curated_df
+curated_df
     .write
     .mode("overwrite")
     .partitionBy("year", "month")
-    .parquet(CURATED_PATH)
+    .parquet(batch_path)
 )
+
+if new_count:
+    (
+        new_curated_df
+        .write
+        .mode("append")
+        .partitionBy("year", "month")
+        .parquet(CURATED_PATH)
+    )
 
 print(
     "Curated data written successfully to:",
     CURATED_PATH
 )
+
+save_transform_manifest(updated_manifest)
+print(f"Pending curated batch written to: {batch_path}")
 
 
 # ---------------------------------------------------------

@@ -91,6 +91,8 @@ PySpark standardizes timestamps, removes invalid and duplicate records, and writ
 - Wind direction is in the range [0, 360)
 - Station and timestamp combinations are unique
 
+The recurring transformation tracks raw S3 objects by key and ETag in an S3 manifest. It processes only new or changed raw page files and writes a run-scoped curated batch as well as appending new records to the accumulated curated dataset. The quality gate and Neon loader read only that batch. The loader inserts its station/timestamp keys, updates only the affected dimensions, and inserts only those facts in one database transaction. A pending-batch marker remains in S3 until the transaction succeeds, so retries reuse the same batch safely. The final Airflow check is batch-aware and avoids recounting the full warehouse.
+
 ### Data Warehouse
 
 Curated data is loaded into PostgreSQL (Neon) using a star schema:
@@ -114,7 +116,7 @@ Curated data is loaded into PostgreSQL (Neon) using a star schema:
 The main DAG runs the following tasks in order, so each step executes only after its predecessor succeeds:
 
 ```text
-run_air_quality_ingestion → transform_air_quality → data_quality_gate → load_air_quality_to_postgres
+run_air_quality_ingestion → transform_air_quality → data_quality_gate → incremental_neon_and_star_schema_load → verify_neon_data
 ```
 
 ## Text-to-SQL Assistant
